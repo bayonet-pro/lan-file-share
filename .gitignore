@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 运行时生成：内含本机共享路径与端口设置，不要提交
+config.json
+error.log
