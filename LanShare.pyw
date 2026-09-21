@@ -517,7 +517,7 @@ def unique_path(directory, filename):
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "LanShare/1.0"
+    server_version = "LanShare/1.1"
     protocol_version = "HTTP/1.1"
 
     root = ""
