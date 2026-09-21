@@ -13,7 +13,9 @@ import re
 import sys
 import json
 import mmap
+import time
 import socket
+import random
 import tempfile
 import mimetypes
 import threading
@@ -249,6 +251,170 @@ def add_firewall_rule():
         return False, str(e)
 
 
+# ---------------------------------------------------------------- 电源控制
+
+POWER_PATH = "__power__"          # 保留路径，几乎不可能和真实文件夹撞名
+
+_power_lock = threading.Lock()
+_power_fails = {}                 # {客户端IP: [连续失败次数, 解锁时间戳]}
+
+
+def popen_hidden(args):
+    """静默拉起外部命令，且不等待它结束。
+
+    睡眠用不上等待 —— rundll32 调 SetSuspendState 之后会一直挂着，
+    等系统睡醒才退出，用 subprocess.run 会把服务器线程一起拖住。
+    """
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return subprocess.Popen(args, close_fds=True, **kw)
+
+
+def power_check_pin(ip, pin):
+    """校验访问码，并做失败节流。返回 (是否通过, 提示语)。"""
+    real = (ShareHandler.power_pin or "").strip()
+    if not real:
+        return True, ""
+
+    now = time.time()
+    with _power_lock:
+        cnt, until = _power_fails.get(ip, (0, 0.0))
+        if until > now:
+            return False, "试错次数太多，请等 %d 秒再试" % (int(until - now) + 1)
+
+    if pin == real:
+        with _power_lock:
+            _power_fails.pop(ip, None)
+        return True, ""
+
+    with _power_lock:
+        cnt, until = _power_fails.get(ip, (0, 0.0))
+        cnt += 1
+        if cnt >= 5:
+            _power_fails[ip] = (0, now + 60)
+            msg = "访问码不对，已锁定 60 秒"
+        else:
+            _power_fails[ip] = (cnt, 0.0)
+            msg = "访问码不对（再错 %d 次锁定 60 秒）" % (5 - cnt)
+    return False, msg
+
+
+POWER_HTML = """<style>
+.pf{position:fixed;right:16px;bottom:calc(20px + env(safe-area-inset-bottom));z-index:20;
+ width:54px;height:54px;border-radius:50%;border:1px solid var(--line);
+ background:rgba(11,20,32,.92);color:var(--pri);padding:0;cursor:pointer;
+ display:flex;align-items:center;justify-content:center;
+ box-shadow:0 0 0 1px rgba(34,225,255,.16),0 6px 22px rgba(0,0,0,.55);}
+.pf:active{transform:scale(.93);}
+.pfm{position:fixed;inset:0;background:rgba(2,5,10,.74);z-index:30;display:none;}
+.pfs{position:fixed;left:0;right:0;bottom:0;z-index:31;background:var(--card);
+ border-top:1px solid var(--line);border-radius:14px 14px 0 0;
+ padding:14px 16px calc(20px + env(safe-area-inset-bottom));display:none;}
+.pfm.on,.pfs.on{display:block;}
+.pfh{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px;}
+.pfh b{font-size:14px;color:var(--pri);letter-spacing:2px;font-weight:700;}
+.pfh i{color:var(--sub);font-size:17px;font-style:normal;padding:0 5px;cursor:pointer;}
+.pfl{font-size:12px;color:var(--sub);margin-bottom:7px;
+ font-family:ui-monospace,Consolas,monospace;letter-spacing:.5px;}
+.pfi{width:100%;padding:12px;background:var(--deep);color:var(--pri);
+ border:1px solid var(--line);border-radius:3px;font-size:19px;letter-spacing:9px;
+ text-align:center;font-family:ui-monospace,Consolas,monospace;outline:none;}
+.pfi:focus{border-color:var(--pri);}
+.pfc{display:flex;align-items:center;gap:7px;margin-top:9px;font-size:12.5px;color:var(--sub);}
+.pfc input{accent-color:#22e1ff;width:15px;height:15px;margin:0;}
+.pfb{display:flex;gap:10px;margin-top:13px;}
+.pfb button{flex:1;width:auto;padding:15px 0;font-size:16px;letter-spacing:2px;font-weight:700;
+ border-radius:3px;border:1px solid var(--line);background:var(--deep);color:var(--txt);}
+.pfb button.dg{border-color:rgba(255,46,136,.5);color:#ff86bd;}
+.pfb button:active{opacity:.8;}
+.pfb button:disabled{opacity:.35;}
+.pfm2{font-size:12.5px;margin-top:11px;min-height:17px;text-align:center;
+ color:var(--sub);font-family:ui-monospace,Consolas,monospace;}
+.pfm2.bad{color:#ff86bd;}
+</style>
+<button class="pf" id="pf" aria-label="power"><svg viewBox="0 0 24 24" width="25" height="25"
+ fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+ <path d="M12 3.5v8.5"/><path d="M6.4 6.6a8 8 0 1 0 11.2 0"/></svg></button>
+<div class="pfm" id="pfm"></div>
+<div class="pfs" id="pfs">
+  <div class="pfh"><b>POWER // 电源控制</b><i id="pfx">&#10005;</i></div>
+  <div id="pfp" style="display:none">
+    <div class="pfl">访问码 ACCESS CODE</div>
+    <input class="pfi" id="pfin" type="tel" inputmode="numeric" maxlength="4" placeholder="&bull;&bull;&bull;&bull;">
+    <label class="pfc"><input type="checkbox" id="pfsv"> 记住访问码</label>
+  </div>
+  <div class="pfb">
+    <button class="sh" id="pbo">睡 眠</button>
+    <button class="dg" id="pbf">关 机</button>
+  </div>
+  <div class="pfm2" id="pfmsg"></div>
+</div>
+<script>
+(function(){
+var NEED=%NEEDPIN%, KEY='lsp_pin_v1';
+var pf=document.getElementById('pf'), pfm=document.getElementById('pfm'), pfs=document.getElementById('pfs'),
+    box=document.getElementById('pfp'), pin=document.getElementById('pfin'), msg=document.getElementById('pfmsg'),
+    bo=document.getElementById('pbo'), bf=document.getElementById('pbf');
+if(NEED) box.style.display='block';
+function say(t,bad){ msg.textContent=t; msg.className='pfm2'+(bad?' bad':''); }
+function open(){
+  if(NEED && !pin.value){ try{ var s=localStorage.getItem(KEY); if(s) pin.value=s; }catch(e){} }
+  pfm.classList.add('on'); pfs.classList.add('on');
+  if(NEED) setTimeout(function(){ try{ pin.focus(); }catch(e){} }, 120);
+}
+function close(){ pfm.classList.remove('on'); pfs.classList.remove('on'); }
+pf.onclick=open; pfm.onclick=close; document.getElementById('pfx').onclick=close;
+function go(a){
+  var p=(pin.value||'').trim();
+  if(NEED && !/^[0-9]{4}$/.test(p)){ say('请输入 4 位访问码',1); return; }
+  say('正在下发指令…',0);
+  var x=new XMLHttpRequest();
+  x.open('POST','/%POWERPATH%',true);
+  x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+  x.onload=function(){
+    var r={}; try{ r=JSON.parse(x.responseText); }catch(e){}
+    if(r && r.ok){
+      try{ if(NEED && document.getElementById('pfsv').checked) localStorage.setItem(KEY,p); }catch(e){}
+      bo.disabled=true; bf.disabled=true;
+      say(a==='shutdown' ? '指令已下达，电脑马上关机' : '指令已下达，电脑即将进入睡眠', 0);
+    } else { say((r&&r.msg)||'操作失败',1); }
+  };
+  x.onerror=function(){ say('连不上电脑 —— 可能已经关机了',1); };
+  x.send('action='+a+'&pin='+encodeURIComponent(p));
+}
+bo.onclick=function(){ go('sleep'); };
+bf.onclick=function(){ go('shutdown'); };
+})();
+</script>"""
+
+
+def power_ui_html():
+    """手机页面里的电源控件。电脑端没开就返回空串，页面上什么都不多。"""
+    if not ShareHandler.allow_power:
+        return ""
+    return (POWER_HTML
+            .replace("%NEEDPIN%", "1" if (ShareHandler.power_pin or "").strip() else "0")
+            .replace("%POWERPATH%", POWER_PATH))
+
+
+def power_exec(action):
+    """等 HTTP 响应先回到手机，再动手 —— 否则手机会看到连接被重置。
+
+    睡眠走 powrprof.SetSuspendState；本机若开着休眠，Windows 会按休眠执行，
+    这是系统自带行为，不折腾。
+    """
+    time.sleep(1.2)
+    try:
+        if action == "shutdown":
+            popen_hidden(["shutdown", "/s", "/t", "0"])
+        elif action == "sleep":
+            popen_hidden(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
+    except Exception:
+        if ShareHandler.log:
+            ShareHandler.log("执行电源指令失败：\n" + traceback.format_exc())
+
+
 # ---------------------------------------------------------------- HTML 模板
 
 PAGE = """<!DOCTYPE html>
@@ -304,6 +470,7 @@ footer{text-align:center;color:var(--sub);font-size:11.5px;padding:16px 0 30px;l
 </style>
 </head>
 <body>
+%POWER%
 <header>
   <h1>%H1%</h1>
   <div class="crumb">%CRUMB%</div>
@@ -315,11 +482,14 @@ footer{text-align:center;color:var(--sub);font-size:11.5px;padding:16px 0 30px;l
 
 
 def page(title, h1, crumb, body, foot=""):
+    # %POWER% 放最后替换：这段 HTML 自带 % 号（width:100% 之类），
+    # 先注入就会被后面的 replace 误伤。
     return (PAGE.replace("%TITLE%", title)
                 .replace("%H1%", h1)
                 .replace("%CRUMB%", crumb)
                 .replace("%BODY%", body)
-                .replace("%FOOT%", foot))
+                .replace("%FOOT%", foot)
+                .replace("%POWER%", power_ui_html()))
 
 
 # ---------------------------------------------------------------- HTTP 处理
@@ -352,6 +522,8 @@ class ShareHandler(BaseHTTPRequestHandler):
 
     root = ""
     allow_upload = True
+    allow_power = False      # 手机能不能关这台电脑，默认不能
+    power_pin = ""           # 4 位访问码，空串 = 不校验
     log = None
 
     # ---- 基础设施
@@ -553,6 +725,9 @@ class ShareHandler(BaseHTTPRequestHandler):
     # ---- POST 上传
 
     def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path.strip("/") == POWER_PATH:
+            self.handle_power()
+            return
         if not ShareHandler.allow_upload:
             self._err(403, "当前未开启上传功能")
             return
@@ -652,6 +827,53 @@ class ShareHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ---- 电源控制（手机端 → 本机）
+
+    def handle_power(self):
+        """只认 POST，且必须先过访问码。
+
+        放在 do_POST 最前面分流，别让它掉进上传分支 —— 上传分支会因为
+        没开上传功能而直接 403，白瞎。
+        """
+        def reply(ok, msg, code=200):
+            payload = json.dumps({"ok": ok, "msg": msg},
+                                 ensure_ascii=False).encode("utf-8")
+            self._send(code, payload, ctype="application/json; charset=utf-8")
+
+        # 请求体必须先读完，再走任何分支：HTTP/1.1 keep-alive 下，
+        # 没读干净的 body 会赖在 socket 里，把下一个请求的报文头顶歪
+        # —— 表现出来就是下一个请求莫名 501。
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        action = (form.get("action", [""])[0] or "").strip()
+        pin = (form.get("pin", [""])[0] or "").strip()
+        ip = self.client_address[0]
+
+        if not ShareHandler.allow_power:
+            reply(False, "电脑端没有开放电源控制", 403)
+            return
+
+        ok, tip = power_check_pin(ip, pin)
+        if not ok:
+            if ShareHandler.log:
+                ShareHandler.log("电源控制被拒（%s）：%s" % (ip, tip))
+            reply(False, tip, 403)
+            return
+
+        if action not in ("shutdown", "sleep"):
+            reply(False, "不支持的指令", 400)
+            return
+
+        if ShareHandler.log:
+            ShareHandler.log("收到手机指令：%s（来自 %s）"
+                             % ("关机" if action == "shutdown" else "睡眠", ip))
+        threading.Thread(target=power_exec, args=(action,), daemon=True).start()
+        reply(True, "已收到")
+
 
 # ---------------------------------------------------------------- 科幻配色
 
@@ -737,7 +959,7 @@ class App:
         self.led_id = self.led.create_oval(1, 1, 11, 11, fill=UI["cyan_dk"], outline="")
         tk.Label(row, text="  LANSHARE", font=("Consolas", 20, "bold"),
                  bg=UI["bg"], fg=UI["cyan"]).pack(side="left")
-        tk.Label(row, text="v1.0", font=("Consolas", 9),
+        tk.Label(row, text="v1.1", font=("Consolas", 9),
                  bg=UI["bg"], fg=UI["sub"]).pack(side="left", padx=(9, 0), pady=(7, 0))
         tk.Label(head, text="LOCAL FILE RELAY   //   局域网文件共享", font=("Consolas", 9),
                  bg=UI["bg"], fg=UI["sub"]).pack(anchor="w", pady=(1, 0))
@@ -762,8 +984,10 @@ class App:
         # ── 端口 / 上传
         p2, b2 = neon_panel(root, "端口与权限  /  PORT & ACCESS")
         p2.pack(fill="x", pady=(11, 0), **pad)
+        r1 = tk.Frame(b2, bg=UI["panel"])
+        r1.pack(fill="x")
         self.var_port = tk.StringVar(value=str(self.cfg.get("port", 80)))
-        self.ent_port = tk.Entry(b2, textvariable=self.var_port, width=5,
+        self.ent_port = tk.Entry(r1, textvariable=self.var_port, width=5,
                                  font=("Consolas", 11, "bold"), justify="center",
                                  bg=UI["deep"], fg=UI["cyan"], insertbackground=UI["cyan"],
                                  relief="flat", bd=0, highlightthickness=1,
@@ -771,14 +995,37 @@ class App:
         self.ent_port.pack(side="left", ipady=5)
         self.ent_port.bind("<FocusOut>", lambda e: self.on_port_change())
         self.ent_port.bind("<Return>", lambda e: self.on_port_change())
-        tk.Label(b2, text=" 80 = 网址免输端口", font=F_TAG,
+        tk.Label(r1, text=" 80 = 网址免输端口", font=F_TAG,
                  bg=UI["panel"], fg=UI["sub"]).pack(side="left", padx=(9, 16))
         self.var_upload = tk.BooleanVar(value=bool(self.cfg.get("upload", True)))
-        tk.Checkbutton(b2, text="允许手机上传", variable=self.var_upload,
+        tk.Checkbutton(r1, text="允许手机上传", variable=self.var_upload,
                        command=self.on_upload_toggle, font=F_UI,
                        bg=UI["panel"], fg=UI["text"], activebackground=UI["panel"],
                        activeforeground=UI["cyan"], selectcolor=UI["deep"],
                        highlightthickness=0, bd=0, cursor="hand2").pack(side="left")
+
+        # ── 手机电源控制（默认关闭：能关你电脑的按钮，不开箱即用）
+        r2 = tk.Frame(b2, bg=UI["panel"])
+        r2.pack(fill="x", pady=(10, 0))
+        self.var_power = tk.BooleanVar(value=bool(self.cfg.get("allow_power", False)))
+        tk.Checkbutton(r2, text="允许手机控制电源", variable=self.var_power,
+                       command=self.on_power_toggle, font=F_UI,
+                       bg=UI["panel"], fg=UI["text"], activebackground=UI["panel"],
+                       activeforeground=UI["magenta"], selectcolor=UI["deep"],
+                       highlightthickness=0, bd=0, cursor="hand2").pack(side="left")
+        self.lbl_pin = tk.Label(r2, text="访问码", font=F_TAG,
+                                bg=UI["panel"], fg=UI["sub"])
+        self.lbl_pin.pack(side="left", padx=(16, 7))
+        self.var_pin = tk.StringVar(value=str(self.cfg.get("power_pin", "")))
+        self.ent_pin = tk.Entry(r2, textvariable=self.var_pin, width=5, justify="center",
+                                font=("Consolas", 12, "bold"),
+                                bg=UI["deep"], fg=UI["magenta"], insertbackground=UI["magenta"],
+                                relief="flat", bd=0, highlightthickness=1,
+                                highlightbackground=UI["line"], highlightcolor=UI["magenta"])
+        self.ent_pin.pack(side="left", ipady=4)
+        self.ent_pin.bind("<FocusOut>", lambda e: self.on_pin_change())
+        self.ent_pin.bind("<Return>", lambda e: self.on_pin_change())
+        self.sync_pin_state()
 
         # ── 主按钮
         self.btn_start = tk.Button(root, text="▶   启 动 共 享", command=self.toggle,
@@ -839,13 +1086,16 @@ class App:
         except Exception:
             default = os.path.join(os.path.expanduser("~"), "Desktop")
             return {"folder": default if os.path.isdir(default) else os.path.expanduser("~"),
-                    "port": 80, "upload": True}
+                    "port": 80, "upload": True, "allow_power": False, "power_pin": ""}
 
     def save_cfg(self):
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump({"folder": self.var_dir.get(), "port": self.var_port.get(),
-                           "upload": self.var_upload.get()}, f, ensure_ascii=False, indent=2)
+                           "upload": self.var_upload.get(),
+                           "allow_power": bool(self.var_power.get()),
+                           "power_pin": self.var_pin.get().strip()},
+                          f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
@@ -928,6 +1178,47 @@ class App:
         if self.server:
             self.print_log("上传功能：%s" % ("开启" if ShareHandler.allow_upload else "关闭"))
 
+    # ---- 手机电源控制
+
+    def sync_pin_state(self):
+        """没开电源控制时，访问码框是灰的（看得见但改不了）。"""
+        on = bool(self.var_power.get())
+        try:
+            self.ent_pin.configure(state="normal" if on else "disabled",
+                                   disabledbackground=UI["deep"],
+                                   disabledforeground=UI["line"])
+        except Exception:
+            pass
+
+    def on_power_toggle(self):
+        on = bool(self.var_power.get())
+        if on and not self.var_pin.get().strip():
+            # 第一次打开就自动配一个，省得用户拍脑袋想一个还记不住
+            self.var_pin.set("%04d" % random.randint(0, 9999))
+        ShareHandler.allow_power = on
+        ShareHandler.power_pin = self.var_pin.get().strip()
+        self.sync_pin_state()
+        self.save_cfg()
+        if on:
+            self.print_log("手机电源控制：已开启（只支持关机 / 睡眠）")
+            self.print_log("访问码：%s —— 手机上要输这个，别写在便签里贴显示器上"
+                           % ShareHandler.power_pin)
+            if self.server:
+                self.print_log("手机刷新页面后，右下角会出现电源按钮。")
+        else:
+            self.print_log("手机电源控制：已关闭，手机上的按钮随即消失")
+
+    def on_pin_change(self):
+        v = self.var_pin.get().strip()
+        if v and not re.match(r"^\d{4}$", v):
+            self.print_log("访问码必须是 4 位数字，这次修改没生效")
+            self.var_pin.set(ShareHandler.power_pin or "")
+            return
+        ShareHandler.power_pin = v
+        self.save_cfg()
+        if self.var_power.get():
+            self.print_log("访问码已改成：%s" % (v or "（空 = 手机不用输码）"))
+
     def on_port_change(self):
         self.save_cfg()
         if not self.server:
@@ -996,6 +1287,8 @@ class App:
         folder = os.path.abspath(folder)
         ShareHandler.root = folder
         ShareHandler.allow_upload = bool(self.var_upload.get())
+        ShareHandler.allow_power = bool(self.var_power.get())
+        ShareHandler.power_pin = self.var_pin.get().strip()
         ShareHandler.log = self.thread_log
 
         try:
@@ -1021,6 +1314,11 @@ class App:
         self.print_log("已启动：%s" % url)
         self.print_log("共享目录：%s" % folder)
         self.print_log("上传功能：%s" % ("开启" if ShareHandler.allow_upload else "关闭"))
+        if ShareHandler.allow_power:
+            self.print_log("电源控制：开启（访问码 %s · 仅关机 / 睡眠）"
+                           % ShareHandler.power_pin)
+        else:
+            self.print_log("电源控制：关闭")
         self.save_cfg()
 
     def update_alt(self):
