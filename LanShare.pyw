@@ -16,6 +16,7 @@ import mmap
 import time
 import socket
 import random
+import secrets
 import tempfile
 import mimetypes
 import threading
@@ -415,6 +416,336 @@ def power_exec(action):
             ShareHandler.log("执行电源指令失败：\n" + traceback.format_exc())
 
 
+# ---------------------------------------------------------------- 手机看屏
+
+SCREEN_PATH = "__screen__"
+SCREEN_BOUNDARY = "lsscframe"
+SCREEN_FPS = 10                  # 抓屏频率。"偶尔瞄一眼"用不着更流畅，省 CPU
+SCREEN_WIDTH = 1280              # 缩放目标宽度，高度按比例走
+SCREEN_QUALITY = 62              # JPEG 质量。实测 70 多花 25% 流量只换来一点清晰度
+SCREEN_MAX_VIEWERS = 4           # 同时看屏的人数上限
+SCREEN_IDLE = 6                  # 没人取帧这么久，抓屏线程就自己退场（秒）
+SCREEN_TOKEN_TTL = 12 * 3600     # 看屏凭证有效期（秒）
+COOKIE_SCREEN = "lssc"
+
+
+class ScreenStream:
+    """主屏画面 → 持续更新的 JPEG 帧缓冲。
+
+    只跑一个抓屏线程，不管几台手机在看。客户端各取「最新一帧」——
+    手机跟不上时自动跳过中间帧，延迟不会越积越多。
+
+    没人看的时候线程自己退场：挂机时不该白烧 CPU。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.seq = 0
+        self.jpeg = b""
+        self.size = (0, 0)
+        self.stamp = 0.0
+        self.viewers = 0
+        self.error = ""
+        self.fps = 0.0
+        self.last_pull = 0.0
+        self._running = False
+        self._gen = 0
+        self._thread = None
+
+    # ---- 客户端进出
+
+    def attach(self):
+        with self.lock:
+            self.viewers += 1
+            n = self.viewers
+            need = not self._running
+            # 「有人来了」也算一次取帧意向 —— 否则客户端刚连上、
+            # 还没轮到取帧的那几秒，线程可能已经自己退场了
+            self.last_pull = time.time()
+        if need:
+            self._start()
+        return n
+
+    def detach(self):
+        """只减计数，不停线程。
+
+        早先这里是「没人看就 _stop()」，踩了个坑：上一个连接断得晚，它的
+        finally 跑在下一个客户端 attach 之后，反手就把新起的抓屏线程掐了 ——
+        后连上来的手机直接黑屏。现在线程存活只看 last_pull（有没有人真在取帧），
+        跟计数彻底解耦。
+        """
+        with self.lock:
+            self.viewers = max(0, self.viewers - 1)
+            return self.viewers
+
+    # ---- 抓屏线程
+    # 光靠一个 running 标志不够：旧线程可能还在 sleep 里打盹，这时新客户端
+    # 进来又起了个线程，等旧线程醒来看到 running=True 就接着跑，结果两个线程
+    # 同时抓屏。带上代次，旧线程醒来一对不上号就自己退场。
+
+    def _start(self):
+        with self.lock:
+            if self._running:
+                return
+            self._running = True
+            self._gen += 1
+            self.last_pull = time.time()
+            gen = self._gen
+        self._thread = threading.Thread(target=self._loop, args=(gen,), daemon=True)
+        self._thread.start()
+
+    def _stop(self):
+        with self.lock:
+            self._running = False
+            self._gen += 1
+        with self.cond:
+            self.cond.notify_all()
+
+    def halt(self):
+        """服务关了 —— 别让抓屏线程继续空转。"""
+        self._stop()
+        with self.lock:
+            self.viewers = 0
+
+    def _alive(self, gen):
+        """还在岗吗？三件事都要满足：没被 halt、代次没被顶掉、最近有人取帧。"""
+        with self.lock:
+            if not self._running or self._gen != gen:
+                return False
+            return (time.time() - self.last_pull) <= SCREEN_IDLE
+
+    def _loop(self, gen):
+        interval = 1.0 / max(1, SCREEN_FPS)
+        try:
+            try:
+                from PIL import Image, ImageGrab
+            except Exception as e:
+                self._fail("这台机器上缺少 Pillow，抓不了屏：%s" % e)
+                return
+
+            marks = []
+            while self._alive(gen):
+                t0 = time.time()
+                try:
+                    shot = ImageGrab.grab()
+                    w, h = shot.size
+                    if w > SCREEN_WIDTH:
+                        nh = max(1, int(round(h * SCREEN_WIDTH / float(w))))
+                        shot = shot.resize((SCREEN_WIDTH, nh), Image.BILINEAR)
+                    buf = io.BytesIO()
+                    shot.save(buf, "JPEG", quality=SCREEN_QUALITY, subsampling=2)
+                    data = buf.getvalue()
+                    with self.cond:
+                        self.seq += 1
+                        self.jpeg = data
+                        self.size = shot.size
+                        self.stamp = time.time()
+                        self.error = ""
+                        self.cond.notify_all()
+                    marks.append(time.time())
+                    if len(marks) > SCREEN_FPS:
+                        marks.pop(0)
+                        span = marks[-1] - marks[0]
+                        if span > 0:
+                            self.fps = (len(marks) - 1) / span
+                except Exception as e:
+                    self._fail(str(e))
+                left = interval - (time.time() - t0)
+                if left > 0:
+                    time.sleep(left)
+        finally:
+            self._retire(gen)
+
+    def _retire(self, gen):
+        """自己收工时把标志放回去。
+
+        漏了这一步，下次有人来看时 attach() 会以为线程还活着、不去起新的 ——
+        手机对着黑屏干瞪眼。这个坑是自测抓出来的。
+        """
+        with self.lock:
+            if self._gen == gen:
+                self._running = False
+        with self.cond:
+            self.cond.notify_all()
+
+    def _fail(self, msg):
+        """抓屏失败就如实记一条，然后歇一秒 —— 别把日志刷成瀑布。"""
+        with self.cond:
+            fresh = msg != self.error
+            self.error = msg
+            self.cond.notify_all()
+        if fresh and ShareHandler.log:
+            ShareHandler.log("抓屏失败：%s" % msg)
+        time.sleep(1.0)
+
+    # ---- 取帧
+
+    def wait_frame(self, last_seq, timeout=15.0):
+        """要一帧比 last_seq 新的。等不到（抓屏停了 / 首帧还没出来）返回 None。
+
+        注意得用循环等：刚 attach 那会儿 seq 还是 0，但如果只看一眼就返回，
+        会拿到空的 jpeg —— 客户端拿到空帧当场就断了。
+        """
+        deadline = time.time() + timeout
+        with self.cond:
+            self.last_pull = time.time()      # 有人在取帧 → 线程别急着退场
+            while True:
+                if self.seq > last_seq and self.jpeg:
+                    return self.seq, self.jpeg, self.size
+                left = deadline - time.time()
+                if left <= 0:
+                    return None
+                # 一帧都还没抓到、而且已经报错了：别让手机对着黑屏干等 20 秒
+                if self.error and not self.jpeg:
+                    return None
+                self.cond.wait(min(left, 1.0))
+
+
+SCREEN = ScreenStream()
+
+_screen_lock = threading.Lock()
+_screen_tokens = {}              # {凭证: 失效时间戳}
+
+
+def screen_pin_required():
+    return bool((ShareHandler.power_pin or "").strip())
+
+
+def screen_issue_token():
+    tok = secrets.token_urlsafe(18)
+    now = time.time()
+    with _screen_lock:
+        for k in [k for k, v in _screen_tokens.items() if v < now]:
+            _screen_tokens.pop(k, None)
+        _screen_tokens[tok] = now + SCREEN_TOKEN_TTL
+    return tok
+
+
+def screen_token_ok(tok):
+    """没设访问码就直接放行 —— 跟电源控制保持一致的门槛。"""
+    if not screen_pin_required():
+        return True
+    if not tok:
+        return False
+    now = time.time()
+    with _screen_lock:
+        exp = _screen_tokens.get(tok)
+        return bool(exp and exp > now)
+
+
+SCREEN_BTN = """<style>
+.sf{position:fixed;right:16px;bottom:calc(%SBOTTOM% + env(safe-area-inset-bottom));z-index:20;
+ width:54px;height:54px;border-radius:50%;border:1px solid var(--line);
+ background:rgba(11,20,32,.92);color:#5ee08a;padding:0;cursor:pointer;
+ display:flex;align-items:center;justify-content:center;
+ box-shadow:0 0 0 1px rgba(94,224,138,.16),0 6px 22px rgba(0,0,0,.55);}
+.sf:active{transform:scale(.93);}
+</style>
+<button class="sf" id="sf" aria-label="screen" onclick="location.href='/%SCREENPATH%'">
+<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="currentColor"
+ stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M2 12s3.7-6.6 10-6.6S22 12 22 12s-3.7 6.6-10 6.6S2 12 2 12z"/>
+<circle cx="12" cy="12" r="2.7"/></svg></button>"""
+
+
+def screen_ui_html():
+    """手机页面右下角的「看屏」按钮。电脑端没开就返回空串，页面上什么都不多。"""
+    if not ShareHandler.allow_screen:
+        return ""
+    # 电源按钮也在右下角，两个都开时把它顶上去一层，免得叠在一起
+    bottom = "84px" if ShareHandler.allow_power else "20px"
+    return (SCREEN_BTN
+            .replace("%SBOTTOM%", bottom)
+            .replace("%SCREENPATH%", SCREEN_PATH))
+
+
+SCREEN_VIEW_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>手机看屏幕</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#000;color:#cfe6f2;
+ font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;}
+.bar{position:fixed;left:0;right:0;top:0;height:42px;z-index:5;display:flex;align-items:center;
+ gap:10px;padding:0 12px;background:rgba(8,12,18,.88);backdrop-filter:blur(10px);
+ border-bottom:1px solid #16344a;}
+.bar a{color:#22e1ff;text-decoration:none;font-size:14px;flex:none}
+.bar .st{flex:1;text-align:center;font-size:11.5px;color:#5d7f96;cursor:pointer;
+ font-family:ui-monospace,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar button{flex:none;width:auto;padding:6px 11px;border:1px solid #16344a;border-radius:3px;
+ background:#04080e;color:#22e1ff;font-size:12.5px;font-family:inherit;font-weight:400;letter-spacing:0}
+.bar button:active{opacity:.75}
+.stage{position:fixed;left:0;right:0;top:42px;bottom:0;overflow:auto;background:#000;
+ -webkit-overflow-scrolling:touch;text-align:center}
+.stage img{display:block;margin:0 auto;background:#000}
+.stage.fit img{width:100%;height:auto}
+.stage.raw img{width:auto;height:auto;max-width:none}
+</style>
+</head>
+<body>
+<div class="bar">
+  <a href="/">&#9664; 文件</a>
+  <span class="st" id="st" title="点一下重连">连接中…</span>
+  <button id="zm">原始大小</button>
+</div>
+<div class="stage fit" id="stage"><img id="im" src="/%SCREENPATH%/feed" alt=""></div>
+<script>
+(function(){
+var im=document.getElementById('im'), st=document.getElementById('st'),
+    stage=document.getElementById('stage'), zm=document.getElementById('zm');
+
+function feed(){ return '/%SCREENPATH%/feed?t=' + Date.now(); }
+function reopen(){ try{ im.src=feed(); }catch(e){} }
+
+im.onload=function(){ st.textContent='已连接 · ' + im.naturalWidth + '×' + im.naturalHeight; };
+im.onerror=function(){ st.textContent='断开，正在重连…'; setTimeout(reopen, 1500); };
+st.onclick=function(){ st.textContent='正在重连…'; reopen(); };
+
+zm.onclick=function(){
+  if(stage.className.indexOf('fit') >= 0){
+    stage.className='stage raw'; zm.textContent='适应屏幕';
+  } else {
+    stage.className='stage fit'; zm.textContent='原始大小';
+  }
+};
+// 手机锁屏再解锁，连接常常已经死了，onerror 却不一定触发 —— 回到前台就重连一次
+document.addEventListener('visibilitychange', function(){
+  if(!document.hidden){ st.textContent='正在重连…'; reopen(); }
+});
+})();
+</script>
+</body>
+</html>"""
+
+
+SCREEN_LOGIN_BODY = """<div class="empty" style="padding:26px 16px;text-align:left">
+<div style="color:var(--sub);font-size:13px;line-height:1.9;margin-bottom:14px">
+看屏幕是私密操作：先输入电脑上那个 4 位访问码。</div>
+%MSG%
+<form method="post" action="/%PATH%">
+<input name="pin" type="tel" inputmode="numeric" maxlength="4" autocomplete="off"
+ placeholder="&#8226;&#8226;&#8226;&#8226;"
+ style="width:100%;padding:12px;background:var(--deep);color:var(--pri);
+ border:1px solid var(--line);border-radius:3px;font-size:19px;letter-spacing:9px;
+ text-align:center;font-family:ui-monospace,Consolas,monospace;outline:none">
+<button type="submit" style="margin-top:14px">进 入</button>
+</form></div>"""
+
+
+def screen_login_html(msg=""):
+    tip = ('<div class="toast" style="margin-bottom:12px">%s</div>' % msg) if msg else ""
+    body = (SCREEN_LOGIN_BODY
+            .replace("%MSG%", tip)
+            .replace("%PATH%", SCREEN_PATH))
+    return page("手机看屏幕", "&#128065; 手机看屏幕",
+                '<a href="/">&#9666; 根目录</a>', body)
+
+
 # ---------------------------------------------------------------- HTML 模板
 
 PAGE = """<!DOCTYPE html>
@@ -470,6 +801,7 @@ footer{text-align:center;color:var(--sub);font-size:11.5px;padding:16px 0 30px;l
 </style>
 </head>
 <body>
+%SCREEN%
 %POWER%
 <header>
   <h1>%H1%</h1>
@@ -482,13 +814,14 @@ footer{text-align:center;color:var(--sub);font-size:11.5px;padding:16px 0 30px;l
 
 
 def page(title, h1, crumb, body, foot=""):
-    # %POWER% 放最后替换：这段 HTML 自带 % 号（width:100% 之类），
+    # %POWER% / %SCREEN% 放最后替换：这两段 HTML 自带 % 号（width:100% 之类），
     # 先注入就会被后面的 replace 误伤。
     return (PAGE.replace("%TITLE%", title)
                 .replace("%H1%", h1)
                 .replace("%CRUMB%", crumb)
                 .replace("%BODY%", body)
                 .replace("%FOOT%", foot)
+                .replace("%SCREEN%", screen_ui_html())
                 .replace("%POWER%", power_ui_html()))
 
 
@@ -517,13 +850,14 @@ def unique_path(directory, filename):
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "LanShare/1.1"
+    server_version = "LanShare/1.2"
     protocol_version = "HTTP/1.1"
 
     root = ""
     allow_upload = True
     allow_power = False      # 手机能不能关这台电脑，默认不能
-    power_pin = ""           # 4 位访问码，空串 = 不校验
+    allow_screen = False     # 手机能不能看这台电脑的屏幕，默认不能
+    power_pin = ""           # 4 位访问码，空串 = 不校验（电源与看屏共用）
     log = None
 
     # ---- 基础设施
@@ -562,6 +896,11 @@ class ShareHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             parsed = urllib.parse.urlsplit(self.path)
+            route = parsed.path.strip("/")
+            # 看屏走独立分流，别掉进文件分支 —— 那边会把未知名当路径去找文件
+            if route == SCREEN_PATH or route.startswith(SCREEN_PATH + "/"):
+                self.handle_screen(route)
+                return
             target = safe_path(self.root, parsed.path)
             if target is None:
                 self._err(403, "路径不合法")
@@ -725,8 +1064,12 @@ class ShareHandler(BaseHTTPRequestHandler):
     # ---- POST 上传
 
     def do_POST(self):
-        if urllib.parse.urlsplit(self.path).path.strip("/") == POWER_PATH:
+        route = urllib.parse.urlsplit(self.path).path.strip("/")
+        if route == POWER_PATH:
             self.handle_power()
+            return
+        if route == SCREEN_PATH:
+            self.handle_screen_auth()
             return
         if not ShareHandler.allow_upload:
             self._err(403, "当前未开启上传功能")
@@ -874,6 +1217,144 @@ class ShareHandler(BaseHTTPRequestHandler):
         threading.Thread(target=power_exec, args=(action,), daemon=True).start()
         reply(True, "已收到")
 
+    # ---- 手机看屏（手机端 ← 本机屏幕）
+
+    def read_cookie(self, name):
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip() == name:
+                    return v.strip()
+        return ""
+
+    def drain_body(self):
+        """把请求体读干净再往下走。
+
+        HTTP/1.1 keep-alive 下，剩在 socket 里的 body 会把下一个请求的报文头
+        顶歪 —— 表现出来就是下一个请求莫名 501。
+        """
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = 0
+        return self.rfile.read(n) if n > 0 else b""
+
+    def handle_screen_auth(self):
+        """POST /__screen__ —— 校验访问码，换一张看屏凭证（cookie）。"""
+        raw = self.drain_body()
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        pin = (form.get("pin", [""])[0] or "").strip()
+        ip = self.client_address[0]
+
+        if not ShareHandler.allow_screen:
+            self._send(403, screen_login_html("电脑端没有开放屏幕查看"))
+            return
+
+        ok, tip = power_check_pin(ip, pin)
+        if not ok:
+            if ShareHandler.log:
+                ShareHandler.log("看屏被拒（%s）：%s" % (ip, tip))
+            self._send(403, screen_login_html(tip))
+            return
+
+        tok = screen_issue_token()
+        if ShareHandler.log:
+            ShareHandler.log("有人通过了看屏验证（来自 %s）" % ip)
+        # 凭证塞 cookie，不放 URL —— 免得它留在浏览器历史和访问日志里
+        self.send_response(303)
+        self.send_header("Location", "/" + SCREEN_PATH)
+        self.send_header("Set-Cookie",
+                         "%s=%s; Path=/; Max-Age=%d; SameSite=Lax; HttpOnly"
+                         % (COOKIE_SCREEN, tok, SCREEN_TOKEN_TTL))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def handle_screen(self, route):
+        """GET /__screen__ · /__screen__/feed · /__screen__/snap.jpg"""
+        if not ShareHandler.allow_screen:
+            self._err(403, "电脑端没有开放屏幕查看")
+            return
+
+        sub = route[len(SCREEN_PATH):].strip("/")
+        tok = self.read_cookie(COOKIE_SCREEN)
+
+        if not sub or sub == "view":
+            if not screen_token_ok(tok):
+                self._send(200, screen_login_html())
+                return
+            self._send(200, SCREEN_VIEW_HTML.replace("%SCREENPATH%", SCREEN_PATH))
+            return
+
+        if not screen_token_ok(tok):
+            self._err(403, "看屏凭证已失效，请重新输入访问码")
+            return
+
+        if sub == "feed":
+            self.stream_screen()
+            return
+
+        if sub == "snap.jpg":
+            SCREEN.attach()
+            try:
+                frame = SCREEN.wait_frame(-1, timeout=8.0)
+            finally:
+                SCREEN.detach()
+            if not frame:
+                self._err(503, "暂时抓不到画面")
+                return
+            self._send(200, frame[1], ctype="image/jpeg",
+                       extra={"X-Screen-Size": "%dx%d" % frame[2]})
+            return
+
+        self._err(404, "没有这个地址")
+
+    def stream_screen(self):
+        """MJPEG 推流。浏览器拿 <img> 就能直接吃，不用一行解码代码。"""
+        n = SCREEN.attach()
+        if n > SCREEN_MAX_VIEWERS:
+            SCREEN.detach()
+            self._err(503, "同时看屏的人太多（上限 %d 个），稍后再试"
+                      % SCREEN_MAX_VIEWERS)
+            return
+        ip = self.client_address[0]
+        if ShareHandler.log:
+            ShareHandler.log("开始看屏（来自 %s，共 %d 人在看）" % (ip, n))
+
+        boundary = ("--" + SCREEN_BOUNDARY).encode("ascii")
+        try:
+            # 手机 WiFi 卡住时写 socket 会一直挂着 —— 给个上限，超时直接踢掉
+            self.connection.settimeout(20.0)
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "multipart/x-mixed-replace; boundary=%s" % SCREEN_BOUNDARY)
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            last = -1
+            while True:
+                got = SCREEN.wait_frame(last, timeout=20.0)
+                if got is None:
+                    break
+                last, jpeg, _size = got
+                self.wfile.write(boundary + b"\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(b"Content-Length: %d\r\n\r\n" % len(jpeg))
+                self.wfile.write(jpeg)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            pass
+        except Exception:
+            if ShareHandler.log:
+                ShareHandler.log("屏幕流中断：\n" + traceback.format_exc())
+        finally:
+            left = SCREEN.detach()
+            if ShareHandler.log:
+                ShareHandler.log("结束看屏（来自 %s，还有 %d 人在看）" % (ip, left))
+
 
 # ---------------------------------------------------------------- 科幻配色
 
@@ -959,7 +1440,7 @@ class App:
         self.led_id = self.led.create_oval(1, 1, 11, 11, fill=UI["cyan_dk"], outline="")
         tk.Label(row, text="  LANSHARE", font=("Consolas", 20, "bold"),
                  bg=UI["bg"], fg=UI["cyan"]).pack(side="left")
-        tk.Label(row, text="v1.1", font=("Consolas", 9),
+        tk.Label(row, text="v1.2", font=("Consolas", 9),
                  bg=UI["bg"], fg=UI["sub"]).pack(side="left", padx=(9, 0), pady=(7, 0))
         tk.Label(head, text="LOCAL FILE RELAY   //   局域网文件共享", font=("Consolas", 9),
                  bg=UI["bg"], fg=UI["sub"]).pack(anchor="w", pady=(1, 0))
@@ -1025,6 +1506,19 @@ class App:
         self.ent_pin.pack(side="left", ipady=4)
         self.ent_pin.bind("<FocusOut>", lambda e: self.on_pin_change())
         self.ent_pin.bind("<Return>", lambda e: self.on_pin_change())
+
+        # ── 手机看屏（同样默认关闭：屏幕上可能开着聊天框、账单、密码框）
+        r3 = tk.Frame(b2, bg=UI["panel"])
+        r3.pack(fill="x", pady=(9, 0))
+        self.var_screen = tk.BooleanVar(value=bool(self.cfg.get("allow_screen", False)))
+        tk.Checkbutton(r3, text="允许手机查看屏幕", variable=self.var_screen,
+                       command=self.on_screen_toggle, font=F_UI,
+                       bg=UI["panel"], fg=UI["text"], activebackground=UI["panel"],
+                       activeforeground=UI["green"], selectcolor=UI["deep"],
+                       highlightthickness=0, bd=0, cursor="hand2").pack(side="left")
+        tk.Label(r3, text="共用上面的访问码", font=F_TAG,
+                 bg=UI["panel"], fg=UI["sub"]).pack(side="left", padx=(16, 0))
+
         self.sync_pin_state()
 
         # ── 主按钮
@@ -1086,7 +1580,8 @@ class App:
         except Exception:
             default = os.path.join(os.path.expanduser("~"), "Desktop")
             return {"folder": default if os.path.isdir(default) else os.path.expanduser("~"),
-                    "port": 80, "upload": True, "allow_power": False, "power_pin": ""}
+                    "port": 80, "upload": True, "allow_power": False,
+                    "allow_screen": False, "power_pin": ""}
 
     def save_cfg(self):
         try:
@@ -1094,6 +1589,7 @@ class App:
                 json.dump({"folder": self.var_dir.get(), "port": self.var_port.get(),
                            "upload": self.var_upload.get(),
                            "allow_power": bool(self.var_power.get()),
+                           "allow_screen": bool(self.var_screen.get()),
                            "power_pin": self.var_pin.get().strip()},
                           f, ensure_ascii=False, indent=2)
         except Exception:
@@ -1181,8 +1677,8 @@ class App:
     # ---- 手机电源控制
 
     def sync_pin_state(self):
-        """没开电源控制时，访问码框是灰的（看得见但改不了）。"""
-        on = bool(self.var_power.get())
+        """电源和看屏都没开时，访问码框是灰的（看得见但改不了）。"""
+        on = bool(self.var_power.get()) or bool(self.var_screen.get())
         try:
             self.ent_pin.configure(state="normal" if on else "disabled",
                                    disabledbackground=UI["deep"],
@@ -1207,6 +1703,25 @@ class App:
                 self.print_log("手机刷新页面后，右下角会出现电源按钮。")
         else:
             self.print_log("手机电源控制：已关闭，手机上的按钮随即消失")
+
+    def on_screen_toggle(self):
+        on = bool(self.var_screen.get())
+        if on and not self.var_pin.get().strip():
+            # 跟电源控制一样，第一次打开就自动配一个，省得用户拍脑袋想
+            self.var_pin.set("%04d" % random.randint(0, 9999))
+            ShareHandler.power_pin = self.var_pin.get().strip()
+        ShareHandler.allow_screen = on
+        self.sync_pin_state()
+        self.save_cfg()
+        if on:
+            self.print_log("手机看屏：已开启（%d fps · %d 像素宽）"
+                           % (SCREEN_FPS, SCREEN_WIDTH))
+            self.print_log("访问码：%s —— 手机上要输这个才能看"
+                           % ShareHandler.power_pin)
+            if self.server:
+                self.print_log("手机刷新页面后，右下角会出现一个眼睛图标。")
+        else:
+            self.print_log("手机看屏：已关闭，正在看的手机随即断流")
 
     def on_pin_change(self):
         v = self.var_pin.get().strip()
@@ -1288,6 +1803,7 @@ class App:
         ShareHandler.root = folder
         ShareHandler.allow_upload = bool(self.var_upload.get())
         ShareHandler.allow_power = bool(self.var_power.get())
+        ShareHandler.allow_screen = bool(self.var_screen.get())
         ShareHandler.power_pin = self.var_pin.get().strip()
         ShareHandler.log = self.thread_log
 
@@ -1319,6 +1835,11 @@ class App:
                            % ShareHandler.power_pin)
         else:
             self.print_log("电源控制：关闭")
+        if ShareHandler.allow_screen:
+            self.print_log("手机看屏：开启（访问码 %s · %d fps）"
+                           % (ShareHandler.power_pin, SCREEN_FPS))
+        else:
+            self.print_log("手机看屏：关闭")
         self.save_cfg()
 
     def update_alt(self):
@@ -1347,6 +1868,7 @@ class App:
             self.server.server_close()
         except Exception:
             pass
+        SCREEN.halt()
         self.server = None
         self.thread = None
         self.btn_start.configure(text="▶   启 动 共 享", bg=UI["cyan"],

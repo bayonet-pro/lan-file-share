@@ -16,8 +16,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] 安装打包依赖 ^(pyinstaller / qrcode^) ...
-python -m pip install --quiet --upgrade pyinstaller qrcode
+echo [1/3] 安装打包依赖 ^(pyinstaller / qrcode / pillow^) ...
+python -m pip install --quiet --upgrade pyinstaller qrcode pillow
 if errorlevel 1 (
     echo [错误] 依赖安装失败，请检查网络或 pip 源。
     echo.
@@ -31,7 +31,10 @@ if exist dist rmdir /s /q dist
 
 echo [3/3] 开始打包，约 30~60 秒，请稍候 ...
 python -m PyInstaller --noconfirm --clean --onefile --noconsole --name LanShare ^
-    --icon LanShare.ico --add-data "LanShare.ico;." --hidden-import qrcode ^
+    --icon LanShare.ico --add-data "LanShare.ico;." ^
+    --hidden-import qrcode ^
+    --hidden-import PIL --hidden-import PIL.Image ^
+    --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin ^
     --distpath dist --workpath build --specpath build LanShare.pyw
 if errorlevel 1 (
     echo.

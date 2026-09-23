@@ -4,7 +4,7 @@
 
 ![界面截图](docs/screenshot.png)
 
-单文件 Python 程序，除生成二维码用的 `qrcode` 外没有第三方依赖，不做任何外网穿透，只在你自己的局域网内监听。
+单文件 Python 程序，只用到 `qrcode`（生成二维码）和 `Pillow`（截屏）两个第三方库，不做任何外网穿透，只在你自己的局域网内监听。
 
 ---
 
@@ -21,6 +21,7 @@
 | 路径穿越防护 | 访问共享目录之外的路径一律 403 |
 | 深色科幻界面 | 桌面端与手机端共用同一套配色 |
 | 手机控制电源 | v1.1 新增：手机远程**关机 / 睡眠**，默认关闭，开启后需输 4 位访问码 |
+| 手机查看屏幕 | v1.2 新增：手机浏览器里实时看电脑主屏，默认关闭，只看不控 |
 
 ## 快速开始
 
@@ -55,15 +56,21 @@ netsh advfirewall firewall add rule name="LanShare File Share (LAN)" dir=in acti
 
 ## 打包成单文件 exe
 
-双击 **`build.bat`**，产物在 `dist\LanShare.exe`（约 28 MB，自带 Python 运行时，拷走就能用）。
+双击 **`build.bat`**，产物在 `dist\LanShare.exe`（约 30 MB，自带 Python 运行时，拷走就能用）。
 
 手动打包：
 
 ```bash
-pip install pyinstaller qrcode
+pip install pyinstaller qrcode pillow
 pyinstaller --noconfirm --clean --onefile --noconsole --name LanShare ^
-  --icon LanShare.ico --add-data "LanShare.ico;." --hidden-import qrcode LanShare.pyw
+  --icon LanShare.ico --add-data "LanShare.ico;." ^
+  --hidden-import qrcode ^
+  --hidden-import PIL --hidden-import PIL.Image ^
+  --hidden-import PIL.ImageGrab --hidden-import PIL.JpegImagePlugin ^
+  LanShare.pyw
 ```
+
+`PIL` 那几行不能省：截屏是**函数内延迟导入**的（`ScreenStream._loop` 里），PyInstaller 的静态分析对这类导入不总是可靠，漏了就会打出一个"能跑但一看屏就报错"的 exe。
 
 ## 常见问题
 
@@ -76,6 +83,9 @@ pyinstaller --noconfirm --clean --onefile --noconsole --name LanShare ^
 | 想改成默认共享某个目录 | 第一次在界面里选好即可，设置会记在 `config.json` 里 |
 | 手机点了关机后网页就打不开了 | 正常——电脑都关了，服务自然也不在了。想再唤醒得靠手机 WOL App 或路由器，网页做不到 |
 | 点了「睡眠」但感觉像休眠 | 系统启用了休眠时的正常表现，见下一节 |
+| 手机看屏一片黑 | 多半是锁屏或 UAC 弹窗挡着——**安全桌面拍不到**，见下文说明 |
+| 手机看屏很卡 | 先看 Wi-Fi 信号；10 fps 是刻意限的，调大 `SCREEN_FPS` 可以提速，但 CPU 占用同步上升 |
+| 看屏时电脑变卡 | 抓屏要占约三分之一单核，打游戏或跑渲染时建议把这个开关关掉 |
 
 ## 手机远程关机 / 睡眠（v1.1）
 
@@ -91,12 +101,34 @@ pyinstaller --noconfirm --clean --onefile --noconsole --name LanShare ^
 
 实现上，电源指令走保留路径 `__power__`，只接受 POST；关机用 `shutdown /s /t 0`，睡眠用 `rundll32 powrprof.dll,SetSuspendState`，两者都**不需要管理员权限**。
 
+## 手机查看屏幕（v1.2）
+
+电脑端勾选 **允许手机查看屏幕**，手机页面右下角就会出现一个眼睛图标。点进去输一次访问码，就能看到电脑主屏的实时画面。
+
+技术上就是一个 MJPEG 流（`multipart/x-mixed-replace`）——浏览器拿 `<img>` 标签直接就能播，手机端不需要装任何东西。默认 **1280×720 / 10 fps / 单帧约 105 KB**，局域网里肉眼延迟约 200 毫秒：够看清文字和进度，但别指望拿它看电影。
+
+**只能看，不能操作。** 想远程控制（点鼠标、敲键盘），请用 RustDesk 这类专门的软件——自制方案要多做输入注入，工作量翻倍，可靠性还不如现成的。
+
+### 几个设计上的取舍
+
+- **没人看的时候不抓屏。** 抓屏线程只在真有客户端取帧时活着；手机关掉页面 6 秒后线程自己退场，挂机不烧 CPU。
+- **只跑一个抓屏线程。** 几台手机同时看，共享同一帧缓冲、各取"最新一帧"——看的人变多不会让 CPU 成倍涨，只是每台手机的帧率被摊薄。
+- **同时看屏上限 4 人**，超出直接 503。
+- **凭证走 Cookie，不走 URL。** 访问码校验通过后发一张随机凭证（12 小时有效），存在 `HttpOnly` cookie 里，不会留在浏览器历史或访问日志中。
+- **访问码和电源控制共用**——一个码管两件事，少记一个。
+
+### 拍不到的东西
+
+Windows 的**安全桌面**——UAC 弹窗、`Ctrl+Alt+Del` 界面、锁屏登录界面——普通截屏 API 拍不到，这些时候手机上会看到一片黑。想越过这道墙，程序得以 SYSTEM 权限注册成 Windows 服务（RustDesk、VNC 就是这么干的）。本程序是普通桌面程序，不越这条线。
+
 ## 技术说明
 
-- **HTTP 服务**：标准库 `http.server.ThreadingHTTPServer`，实现 `Range`（206）、流式上传、目录穿越防护
+- **HTTP 服务**：标准库 `http.server.ThreadingHTTPServer`，实现 `Range`（206）、流式上传、MJPEG 推流、目录穿越防护
 - **界面**：`tkinter` 手绘深色主题（刻意不用 `ttk` 的分隔符与 `LabelFrame`——它们在深色下样式不可控）
-- **二维码**：取 `qrcode` 的 `get_matrix()` 直接画到 `tkinter.Canvas` 上，因此**不依赖 Pillow**
-- **配置**：`config.json` 与程序同目录，记录共享路径、端口、上传开关、电源控制开关与访问码
+- **二维码**：取 `qrcode` 的 `get_matrix()` 直接画到 `tkinter.Canvas` 上，不经过图片文件
+- **截屏**：`PIL.ImageGrab` 抓主屏 → `Image.resize` 缩放 → JPEG 编码。实测 1080p 下单帧约 40 ms，**瓶颈在抓屏（25 ms）而不在编码（14 ms）**——所以降分辨率救不了帧率，只能省带宽
+- **保留路径**：`__power__`（电源）、`__screen__`（看屏），都用双下划线包夹，几乎不可能和真实文件夹撞名
+- **配置**：`config.json` 与程序同目录，记录共享路径、端口、上传开关、电源与看屏开关、访问码
 
 ### 三个踩过的坑
 
@@ -146,6 +178,18 @@ for _ in range(3):
 ```
 
 规矩很简单：**先把 `Content-Length` 指定的字节读干净，再做任何判断。**
+
+**4. 一个没做干净的「退场」，会让后来的人黑屏**
+
+抓屏线程的存活最初按"有几个人在看"来管：`viewers` 减到 0 就 `_stop()`。看着天经地义，实际有个时序洞——**上一个连接的 `finally` 可能跑在下一个客户端 `attach()` 之后**。于是它那次迟到的 `detach()` 把计数减到 0，反手就把刚起来的抓屏线程掐了，后连上来的手机对着黑屏干瞪眼。手机刷新得越快越容易撞上。
+
+改法是让线程存活和人数**解耦**：线程自己看 `last_pull`（最近一次有人取帧的时刻），空闲超过 6 秒才退场；`viewers` 只用来算并发上限。这样迟到的 `detach()` 顶多让计数短暂偏一下，伤不到线程。
+
+同一个坑还有第二半：线程自己退场时**必须把 `running` 标志复位**，否则下次 `attach()` 看到它还是 `True`，就不起新线程了——照样黑屏。
+
+两处都是单元测试抓出来的（看 `断流后立刻重连` 那条用例）。
+
+教训：**只要存在迟到的回调，用「外部计数」控制「内部线程」的生命周期就一定有窗口。**
 
 ## 许可
 
